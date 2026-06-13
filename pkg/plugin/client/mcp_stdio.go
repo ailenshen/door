@@ -59,6 +59,14 @@ func init() {
 // "notifications/initialized" notification, replaying them whenever a new
 // child is started.
 //
+// Because a stdio MCP server only supports a single "initialize" per
+// process lifetime, a client "initialize" sent while the current child is
+// already initialized is not forwarded: the cached "initialize" response is
+// replayed back to the client (with its id rewritten to match), and a
+// repeat "notifications/initialized" is swallowed. This lets HTTP clients
+// re-initialize (e.g. after losing their session) without breaking a
+// long-lived child that never gets reaped.
+//
 // A single worker goroutine owns the child process and all its I/O, so no
 // mutexes are needed. HTTP handlers communicate with the worker via channels.
 type MCPStdioPlugin struct {
@@ -189,6 +197,12 @@ func (p *MCPStdioPlugin) worker() {
 		lastUsedAt     time.Time
 		cachedInitReq  []byte
 		cachedInitNote []byte
+		cachedInitResp []byte
+
+		// childInitialized and childInitNoteSent track the current child's
+		// handshake state; they are reset whenever the child is killed.
+		childInitialized  bool
+		childInitNoteSent bool
 	)
 
 	type readResult struct {
@@ -262,6 +276,8 @@ func (p *MCPStdioPlugin) worker() {
 		child = nil
 		childIn = nil
 		childOut = nil
+		childInitialized = false
+		childInitNoteSent = false
 	}
 
 	ensureChild := func() error {
@@ -300,16 +316,20 @@ func (p *MCPStdioPlugin) worker() {
 				killChild()
 				return fmt.Errorf("replay initialize: %w", err)
 			}
-			if _, err := readLine(childOut); err != nil {
+			resp, err := readLine(childOut)
+			if err != nil {
 				killChild()
 				return fmt.Errorf("replay initialize read: %w", err)
 			}
+			cachedInitResp = append(cachedInitResp[:0], bytes.TrimRight(resp, "\r\n")...)
+			childInitialized = true
 		}
 		if cachedInitNote != nil {
 			if _, err := fmt.Fprintf(childIn, "%s\n", cachedInitNote); err != nil {
 				killChild()
 				return fmt.Errorf("replay initialized notification: %w", err)
 			}
+			childInitNoteSent = true
 		}
 		return nil
 	}
@@ -345,6 +365,25 @@ func (p *MCPStdioPlugin) worker() {
 				continue
 			}
 
+			// A child supports only one "initialize" per process lifetime.
+			// If it's already initialized, virtualize a repeat "initialize"
+			// (and swallow a repeat "notifications/initialized") instead of
+			// forwarding to the child, so HTTP clients can re-initialize
+			// without disturbing a long-lived child.
+			if isInit && childInitialized && cachedInitResp != nil {
+				resp, err := withReplacedID(cachedInitResp, reqID)
+				if err != nil {
+					req.replyCh <- dispatchResp{err: fmt.Errorf("rewrite cached initialize response: %w", err)}
+					continue
+				}
+				req.replyCh <- dispatchResp{data: resp}
+				continue
+			}
+			if isInitNote && childInitNoteSent {
+				req.replyCh <- dispatchResp{}
+				continue
+			}
+
 			if isInit {
 				cachedInitReq = append(cachedInitReq[:0], req.body...)
 			}
@@ -360,6 +399,9 @@ func (p *MCPStdioPlugin) worker() {
 			lastUsedAt = time.Now()
 
 			if !hasID {
+				if isInitNote {
+					childInitNoteSent = true
+				}
 				req.replyCh <- dispatchResp{}
 				continue
 			}
@@ -371,6 +413,10 @@ func (p *MCPStdioPlugin) worker() {
 				continue
 			}
 			lastUsedAt = time.Now()
+			if isInit {
+				cachedInitResp = append(cachedInitResp[:0], line...)
+				childInitialized = true
+			}
 			req.replyCh <- dispatchResp{data: line}
 		}
 	}
@@ -398,6 +444,25 @@ func classifyJSONRPC(body []byte) (hasID bool, reqID string, isInit, isInitNote 
 	isInit = head.Method == "initialize"
 	isInitNote = head.Method == "notifications/initialized"
 	return
+}
+
+// withReplacedID returns a copy of a JSON-RPC response line with its "id"
+// field replaced by the raw JSON value reqID, so a cached response can be
+// replayed to a client under its own request id.
+func withReplacedID(line []byte, reqID string) ([]byte, error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(line, &m); err != nil {
+		return nil, fmt.Errorf("unmarshal cached response: %w", err)
+	}
+	if reqID == "" {
+		reqID = "null"
+	}
+	m["id"] = json.RawMessage(reqID)
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("marshal cached response: %w", err)
+	}
+	return out, nil
 }
 
 func pipeStderrToLog(r io.Reader, name string) {
